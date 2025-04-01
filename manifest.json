@@ -1,6 +1,6 @@
 {
-    "display_name": "隐藏助手123.4",
-    "loading_order": 18,
+    "display_name": "隐藏助手123.5",
+    "loading_order": 17,
     "requires": [],
     "optional": [],
     "js": "index.js",
