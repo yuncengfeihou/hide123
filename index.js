@@ -5,11 +5,12 @@ import { hideChatMessageRange } from "../../../chats.js";
 
 const extensionName = "hide-helper";
 const defaultSettings = {
+    // 保留全局默认设置用于向后兼容
     hideLastN: 0,
     lastAppliedSettings: null
 };
 
-// Initialize extension settings
+// 初始化扩展设置
 function loadSettings() {
     extension_settings[extensionName] = extension_settings[extensionName] || {};
     if (Object.keys(extension_settings[extensionName]).length === 0) {
@@ -17,7 +18,7 @@ function loadSettings() {
     }
 }
 
-// Create UI panel
+// 创建UI面板
 function createUI() {
     const hideHelperPanel = document.createElement('div');
     hideHelperPanel.id = 'hide-helper-panel';
@@ -27,100 +28,138 @@ function createUI() {
             <label for="hide-last-n">隐藏楼层:</label>
             <input type="number" id="hide-last-n" min="0" placeholder="隐藏最后N层之前的消息">
             <div class="hide-helper-buttons">
-                <button id="hide-apply-btn">应用</button>
+                <button id="hide-save-settings-btn">保存设置</button>
             </div>
         </div>
-        <button class="save-settings-btn" id="hide-save-settings-btn">保存当前设置</button>
+        <div class="hide-helper-current">
+            <strong>当前隐藏设置:</strong> <span id="hide-current-value">无</span>
+        </div>
     `;
     document.body.appendChild(hideHelperPanel);
 
-    // Setup event listeners
+    // 设置事件监听器
     setupEventListeners();
 }
 
-// Setup event listeners for UI elements
+// 获取当前角色/群组的隐藏设置
+function getCurrentHideSettings() {
+    const context = getContext();
+    const isGroup = !!context.groupId;
+    const target = isGroup 
+        ? context.groups.find(x => x.id == context.groupId)
+        : context.characters[context.characterId];
+    
+    if (!target) return null;
+    
+    // 检查是否有保存的设置
+    if (target.data?.hideHelperSettings) {
+        return target.data.hideHelperSettings;
+    }
+    
+    // 没有则返回null
+    return null;
+}
+
+// 保存当前角色/群组的隐藏设置
+function saveCurrentHideSettings(hideLastN) {
+    const context = getContext();
+    const isGroup = !!context.groupId;
+    const target = isGroup 
+        ? context.groups.find(x => x.id == context.groupId)
+        : context.characters[context.characterId];
+    
+    if (!target) return false;
+    
+    // 初始化data对象如果不存在
+    target.data = target.data || {};
+    target.data.hideHelperSettings = target.data.hideHelperSettings || {};
+    
+    // 保存设置
+    target.data.hideHelperSettings.hideLastN = hideLastN;
+    return true;
+}
+
+// 更新当前设置显示
+function updateCurrentHideSettingsDisplay() {
+    const currentSettings = getCurrentHideSettings();
+    const displayElement = document.getElementById('hide-current-value');
+    
+    if (!currentSettings || currentSettings.hideLastN === 0) {
+        displayElement.textContent = '无';
+    } else {
+        displayElement.textContent = currentSettings.hideLastN;
+    }
+}
+
+// 设置UI元素的事件监听器
 function setupEventListeners() {
-    // Last N hide input
     const hideLastNInput = document.getElementById('hide-last-n');
-    hideLastNInput.value = extension_settings[extensionName].hideLastN || '';
+    
+    // 监听输入变化
     hideLastNInput.addEventListener('input', (e) => {
         const value = parseInt(e.target.value) || 0;
-        extension_settings[extensionName].hideLastN = value;
-        saveSettingsDebounced();
+        hideLastNInput.value = value >= 0 ? value : '';
     });
 
-    // Apply button
-    document.getElementById('hide-apply-btn').addEventListener('click', applyHideSettings);
+    // 保存设置按钮
+    document.getElementById('hide-save-settings-btn').addEventListener('click', () => {
+        const value = parseInt(hideLastNInput.value) || 0;
+        if (saveCurrentHideSettings(value)) {
+            applyHideSettings();
+            updateCurrentHideSettingsDisplay();
+            toastr.success('隐藏设置已保存');
+        } else {
+            toastr.error('无法保存设置');
+        }
+    });
 
-    // Save settings button
-    document.getElementById('hide-save-settings-btn').addEventListener('click', saveCurrentSettings);
+    // 监听聊天切换事件
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        const currentSettings = getCurrentHideSettings();
+        hideLastNInput.value = currentSettings?.hideLastN || '';
+        updateCurrentHideSettingsDisplay();
+    });
 
-    // Listen for new messages to reapply settings if needed
+    // 监听新消息事件
     eventSource.on(event_types.MESSAGE_RECEIVED, () => {
-        if (extension_settings[extensionName].lastAppliedSettings) {
-            applyLastSettings();
+        const currentSettings = getCurrentHideSettings();
+        if (currentSettings?.hideLastN > 0) {
+            applyHideSettings();
         }
     });
 }
 
-// Apply hide settings based on "hide last N" option
+// 应用隐藏设置
 async function applyHideSettings() {
     const context = getContext();
     const chatLength = context.chat?.length || 0;
+    const currentSettings = getCurrentHideSettings();
+    const hideLastN = currentSettings?.hideLastN || 0;
     
     if (chatLength === 0) return;
     
-    const hideLastN = extension_settings[extensionName].hideLastN || 0;
-    
     if (hideLastN > 0 && hideLastN < chatLength) {
         const visibleStart = chatLength - hideLastN;
-        // First unhide all messages
+        // 先取消隐藏所有消息
         await hideChatMessageRange(0, chatLength - 1, true);
-        // Then hide the range we want to hide
+        // 然后隐藏指定范围
         await hideChatMessageRange(0, visibleStart - 1, false);
-        
-        extension_settings[extensionName].lastAppliedSettings = {
-            type: 'lastN',
-            value: hideLastN
-        };
-        saveSettingsDebounced();
     } else if (hideLastN === 0) {
-        // Unhide all messages
+        // 取消隐藏所有消息
         await hideChatMessageRange(0, chatLength - 1, true);
-        extension_settings[extensionName].lastAppliedSettings = null;
-        saveSettingsDebounced();
     }
 }
 
-// Save current settings
-function saveCurrentSettings() {
-    const hideLastN = extension_settings[extensionName].hideLastN || 0;
-    
-    if (hideLastN >= 0) {
-        applyHideSettings();
-    }
-    
-    toastr.success('隐藏设置已保存并应用');
-}
-
-// Apply last saved settings
-async function applyLastSettings() {
-    const lastSettings = extension_settings[extensionName].lastAppliedSettings;
-    
-    if (!lastSettings) return;
-    
-    if (lastSettings.type === 'lastN') {
-        await applyHideSettings();
-    }
-}
-
-// Initialize extension
+// 初始化扩展
 jQuery(async () => {
     loadSettings();
     createUI();
     
-    // Apply last settings if any
-    if (extension_settings[extensionName].lastAppliedSettings) {
-        setTimeout(applyLastSettings, 1000); // Slight delay to ensure chat is loaded
-    }
+    // 初始加载时更新显示
+    setTimeout(() => {
+        const currentSettings = getCurrentHideSettings();
+        const hideLastNInput = document.getElementById('hide-last-n');
+        hideLastNInput.value = currentSettings?.hideLastN || '';
+        updateCurrentHideSettingsDisplay();
+    }, 1000);
 });
