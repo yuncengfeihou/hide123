@@ -1,485 +1,379 @@
-import { extension_settings, loadExtensionSettings } from "../../../extensions.js";
-import { saveSettingsDebounced, eventSource, event_types } from "../../../../script.js";
 import { getContext } from "../../../extensions.js";
-import { hideChatMessageRange } from "../../../chats.js";
+import { eventSource, event_types } from "../../../../script.js";
+// 注意：saveChatDebounced 通常由 getContext().saveChatDebounced 访问，如果需要直接导入，请确认路径
+// import { saveChatDebounced } from "../../../../script.js";
 
-const extensionName = "hide-helper";
-const defaultSettings = {
-    hideLastN: 0,
-    lastAppliedSettings: null,
-    enablePerformanceMonitoring: false
-};
+const extensionName = "hide-helper"; // 用于在 chat_metadata 中存储设置的键名
 
-// Worker实例和缓存状态
-let messageWorker = null;
-let stateCache = {
-    lastHideN: -1,
-    chatLength: -1,
-    messageStates: []
-};
+// --- Helper Functions ---
 
-// 性能监控数据
-let performanceStats = {
-    lastRunTime: 0,
-    averageRunTime: 0,
-    runCount: 0,
-    lastChangeCount: 0
-};
+/**
+ * 从当前聊天元数据加载设置，如果不存在则使用默认值
+ * @returns {object} 加载的设置对象 { hideLastN, lastProcessedLength }
+ */
+function loadCharacterSettings() {
+    const context = getContext();
+    const chatMetadata = context.chatMetadata || {};
+    const defaultSettings = { hideLastN: 0, lastProcessedLength: 0 };
 
-// 初始化插件设置
-function loadSettings() {
-    // 确保插件设置存在
-    extension_settings[extensionName] = extension_settings[extensionName] || {};
-    
-    // 填充默认值
-    if (Object.keys(extension_settings[extensionName]).length === 0) {
-        Object.assign(extension_settings[extensionName], defaultSettings);
+    let settings = chatMetadata[extensionName];
+
+    if (!settings || typeof settings !== 'object') {
+        console.log(`[${extensionName}] No settings found for this chat, using defaults.`);
+        settings = { ...defaultSettings };
+        // 将默认设置写入元数据，但不立即保存，等待后续操作触发保存
+        context.updateChatMetadata({ [extensionName]: settings });
+    } else {
+        // 确保所有必需的键都存在
+        settings = { ...defaultSettings, ...settings };
     }
-    
-    // 确保所有必要设置都存在
-    for (const key in defaultSettings) {
-        if (extension_settings[extensionName][key] === undefined) {
-            extension_settings[extensionName][key] = defaultSettings[key];
-        }
-    }
-    
-    // 初始化界面
-    updateUI();
-}
 
-// 更新界面元素以反映当前设置
-function updateUI() {
+    // 更新 UI 输入框的值
     const hideLastNInput = document.getElementById('hide-last-n');
     if (hideLastNInput) {
-        hideLastNInput.value = extension_settings[extensionName].hideLastN || '';
+        hideLastNInput.value = settings.hideLastN || 0;
     }
-    
-    const perfToggle = document.getElementById('enable-perf-monitoring');
-    if (perfToggle) {
-        perfToggle.checked = !!extension_settings[extensionName].enablePerformanceMonitoring;
-    }
-    
-    // 更新性能面板可见性
-    const perfPanel = document.getElementById('hide-helper-performance');
-    if (perfPanel) {
-        perfPanel.style.display = extension_settings[extensionName].enablePerformanceMonitoring ? 'block' : 'none';
-    }
+
+    console.log(`[${extensionName}] Loaded settings:`, settings);
+    return settings;
 }
 
-// 创建插件UI
-function createUI() {
-    const hideHelperPanel = document.createElement('div');
-    hideHelperPanel.id = 'hide-helper-panel';
-    hideHelperPanel.className = 'hide-helper-container';
-    hideHelperPanel.innerHTML = `
-        <div class="hide-helper-header">隐藏助手</div>
-        <div class="hide-helper-section">
-            <label for="hide-last-n">隐藏除了最新的N层之外的所有消息:</label>
-            <div class="hide-helper-input-row">
-                <input type="number" id="hide-last-n" min="0" placeholder="例如: 20">
-                <button id="hide-apply-btn" class="hide-helper-btn">应用</button>
-            </div>
-            <div class="hide-helper-actions">
-                <button id="unhide-all-btn" class="hide-helper-btn">显示全部</button>
-                <button id="hide-save-settings-btn" class="hide-helper-btn success">保存设置</button>
-            </div>
-            <div class="hide-helper-checkbox-row">
-                <input type="checkbox" id="enable-perf-monitoring">
-                <label for="enable-perf-monitoring">启用性能监控</label>
-            </div>
-        </div>
-    `;
-    
-    document.body.appendChild(hideHelperPanel);
-    
-    // 创建性能监控面板
-    addPerformancePanel();
-    
-    // 设置事件监听器
-    setupUIEventListeners();
+/**
+ * 将设置保存到当前聊天元数据中
+ * 注意：这只更新内存中的元数据，需要后续调用 context.saveChatDebounced() 或类似机制来持久化
+ * @param {object} settings 要保存的设置对象 { hideLastN, lastProcessedLength }
+ */
+function saveCharacterSettings(settings) {
+    const context = getContext();
+    // 只更新内存中的 chatMetadata
+    context.updateChatMetadata({ [extensionName]: settings });
+    console.log(`[${extensionName}] Updated settings in metadata (pending save):`, settings);
+    // 持久化将在 runFullHideCheck 或 runIncrementalHideCheck 修改 chat 后调用 saveChatDebounced 时发生
+    // 或者可以通过 context.saveMetadata() (如果可用且合适)
 }
 
-// 设置UI元素的事件监听器
-function setupUIEventListeners() {
-    // 应用按钮
-    const applyBtn = document.getElementById('hide-apply-btn');
-    if (applyBtn) {
-        applyBtn.addEventListener('click', () => {
-            const hideLastNInput = document.getElementById('hide-last-n');
-            const value = parseInt(hideLastNInput.value) || 0;
-            extension_settings[extensionName].hideLastN = value;
-            applyHideSettings();
-        });
-    }
-    
-    // 显示全部按钮
-    const unhideAllBtn = document.getElementById('unhide-all-btn');
-    if (unhideAllBtn) {
-        unhideAllBtn.addEventListener('click', () => {
-            extension_settings[extensionName].hideLastN = 0;
-            document.getElementById('hide-last-n').value = '0';
-            applyHideSettings();
-        });
-    }
-    
-    // 保存设置按钮
-    const saveBtn = document.getElementById('hide-save-settings-btn');
-    if (saveBtn) {
-        saveBtn.addEventListener('click', saveCurrentSettings);
-    }
-    
-    // 性能监控复选框
-    const perfToggle = document.getElementById('enable-perf-monitoring');
-    if (perfToggle) {
-        perfToggle.addEventListener('change', function() {
-            extension_settings[extensionName].enablePerformanceMonitoring = this.checked;
-            updateUI();
-            saveSettingsDebounced();
-        });
-    }
-}
 
-// 初始化Web Worker
-function initWorker() {
-    if (window.Worker) {
-        // 终止旧Worker（如果存在）
-        if (messageWorker) {
-            messageWorker.terminate();
-        }
-        
-        try {
-            messageWorker = new Worker(`scripts/extensions/third-party/${extensionName}/message-worker.js`);
-            console.log('隐藏助手: Web Worker初始化成功');
-        } catch (error) {
-            console.error('隐藏助手: Web Worker初始化失败', error);
-            messageWorker = null;
-        }
-    } else {
-        console.warn('隐藏助手: 此浏览器不支持Web Workers');
-    }
-}
+// --- Core Logic Functions ---
 
-// 应用隐藏设置（主函数）
-async function applyHideSettings() {
+/**
+ * 增量隐藏检查 (用于新消息到达)
+ * 仅处理从上次处理长度到现在新增的、需要隐藏的消息
+ */
+function runIncrementalHideCheck() {
     const context = getContext();
     const chat = context.chat;
-    const chatLength = chat?.length || 0;
-    
-    if (chatLength === 0) {
-        toastr.warning('没有消息可以隐藏');
-        return;
-    }
-    
-    const startTime = performance.now();
-    const hideLastN = extension_settings[extensionName].hideLastN || 0;
-    
-    // 处理全部显示的特殊情况
-    if (hideLastN === 0) {
-        const allUnhideStartTime = performance.now();
-        await hideChatMessageRange(0, chatLength - 1, true);
-        const allUnhideEndTime = performance.now();
-        
-        // 更新统计数据
-        performanceStats.lastRunTime = allUnhideEndTime - allUnhideStartTime;
-        performanceStats.lastChangeCount = chatLength;
-        updatePerformanceStats(performanceStats.lastRunTime);
-        
-        // 更新缓存
-        stateCache = {
-            lastHideN: 0,
-            chatLength: chatLength,
-            messageStates: new Array(chatLength).fill(false)
-        };
-        
-        extension_settings[extensionName].lastAppliedSettings = null;
-        saveSettingsDebounced();
-        
-        // 更新性能监控
-        if (extension_settings[extensionName].enablePerformanceMonitoring) {
-            updatePerfPanel(performanceStats.lastRunTime, chatLength, chatLength);
+    const currentChatLength = chat?.length || 0;
+    const settings = loadCharacterSettings(); // 获取当前设置和上次处理长度
+    const { hideLastN, lastProcessedLength } = settings;
+
+    // --- 前置条件检查 ---
+    if (currentChatLength === 0 || hideLastN <= 0) {
+        // 如果 N=0 或无消息，增量无意义。但如果长度变长了，需要更新 lastProcessedLength
+        if (currentChatLength > lastProcessedLength) {
+            settings.lastProcessedLength = currentChatLength;
+            saveCharacterSettings(settings); // 保存更新后的长度
         }
-        
-        toastr.success('所有消息已设为可见');
+        console.log(`[${extensionName}] Incremental check skipped: No chat, hideLastN<=0.`);
         return;
     }
-    
-    // 验证hideLastN是否合理
-    if (hideLastN < 0 || hideLastN >= chatLength) {
-        toastr.error(`无效的值: ${hideLastN}. 应在 0 到 ${chatLength-1} 之间`);
+
+    if (currentChatLength <= lastProcessedLength) {
+        // 长度未增加或减少，说明可能发生删除或其他异常，应由 Full Check 处理
+        console.log(`[${extensionName}] Incremental check skipped: Chat length did not increase (${lastProcessedLength} -> ${currentChatLength}). Might be a delete.`);
+        // 这里不主动调用 Full Check，依赖 MESSAGE_DELETED 事件或下次 CHAT_CHANGED 处理
         return;
     }
-    
-    // 使用Worker处理（如果可用）
-    if (messageWorker && hideLastN > 0 && hideLastN < chatLength) {
-        try {
-            // Worker计算开始
-            const workerStartTime = performance.now();
-            
-            // 使用Promise包装Worker通信
-            const result = await new Promise((resolve, reject) => {
-                // 设置超时保护
-                const timeoutId = setTimeout(() => {
-                    reject(new Error('Worker处理超时'));
-                }, 2000);
-                
-                // 监听Worker消息
-                messageWorker.onmessage = function(e) {
-                    clearTimeout(timeoutId);
-                    resolve(e.data);
-                };
-                
-                // 监听Worker错误
-                messageWorker.onerror = function(error) {
-                    clearTimeout(timeoutId);
-                    reject(error);
-                };
-                
-                // 发送数据到Worker
-                messageWorker.postMessage({
-                    chat: chat.map(msg => ({ is_system: !!msg.is_system })), // 只发送必要数据
-                    hideLastN,
-                    currentCache: stateCache
-                });
+
+    // --- 计算范围 ---
+    const targetVisibleStart = currentChatLength - hideLastN;
+    const previousVisibleStart = lastProcessedLength > 0 ? lastProcessedLength - hideLastN : 0; // 处理首次的情况
+
+    // 必须目标 > 先前才有新增隐藏
+    if (targetVisibleStart > previousVisibleStart && previousVisibleStart >= 0) {
+        const toHideIncrementally = [];
+        const startIndex = Math.max(0, previousVisibleStart); // 确保不为负
+        const endIndex = Math.min(currentChatLength, targetVisibleStart); // 确保不超过当前长度
+
+        // --- 收集需要隐藏的消息 ---
+        for (let i = startIndex; i < endIndex; i++) {
+            // 确保消息存在，当前是可见的，且不是用户消息 (通常不隐藏用户消息)
+            if (chat[i] && chat[i].is_system === false && !chat[i].is_user) {
+                toHideIncrementally.push(i);
+            }
+        }
+
+        // --- 执行批量更新 ---
+        if (toHideIncrementally.length > 0) {
+            console.log(`[${extensionName}] Incrementally hiding messages: ${toHideIncrementally.join(', ')}`);
+
+            // 1. 批量更新数据 (chat 数组)
+            toHideIncrementally.forEach(idx => {
+                if (chat[idx]) chat[idx].is_system = true;
             });
-            
-            // 处理Worker结果
-            const { toChange, newCache, computeTime, manualChangesCount } = result;
-            
-            // 更新性能统计
-            performanceStats.lastRunTime = performance.now() - workerStartTime;
-            performanceStats.lastChangeCount = toChange.length;
-            updatePerformanceStats(performanceStats.lastRunTime);
-            
-            // 更新缓存
-            stateCache = newCache;
-            
-            // 批量更新数据模型和DOM
-            if (toChange.length > 0) {
-                // 更新数据模型
-                for (const item of toChange) {
-                    if (chat[item.index]) {
-                        chat[item.index].is_system = item.hide;
-                    }
+
+            // 2. 批量更新 DOM
+            try {
+                const hideSelector = toHideIncrementally.map(id => `.mes[mesid="${id}"]`).join(',');
+                if (hideSelector) {
+                    $(hideSelector).attr('is_system', 'true');
                 }
-                
-                // 批量更新DOM
-                await new Promise(resolve => {
-                    requestAnimationFrame(() => {
-                        for (const item of toChange) {
-                            const messageBlock = $(`.mes[mesid="${item.index}"]`);
-                            if (messageBlock.length) {
-                                messageBlock.attr('is_system', String(item.hide));
-                            }
-                        }
-                        resolve();
-                    });
-                });
+            } catch (error) {
+                console.error(`[${extensionName}] Error updating DOM incrementally:`, error);
             }
-            
-            // 保存设置
-            extension_settings[extensionName].lastAppliedSettings = {
-                type: 'lastN',
-                value: hideLastN
-            };
-            saveSettingsDebounced();
-            
-            // 更新性能面板
-            if (extension_settings[extensionName].enablePerformanceMonitoring) {
-                updatePerfPanel(performanceStats.lastRunTime, chatLength, toChange.length);
+
+
+            // 3. 保存 Chat (包含 is_system 的修改)
+            context.saveChatDebounced?.(); // 调用上下文提供的防抖保存函数
+        } else {
+             console.log(`[${extensionName}] Incremental check: No messages needed hiding in the new range [${startIndex}, ${endIndex}).`);
+        }
+    } else {
+         console.log(`[${extensionName}] Incremental check: Visible start did not advance or range invalid.`);
+    }
+
+    // --- 更新处理长度并保存设置 ---
+    settings.lastProcessedLength = currentChatLength;
+    saveCharacterSettings(settings);
+}
+
+
+/**
+ * 全量隐藏检查 (优化的差异更新)
+ * 用于加载、切换、删除、设置更改等情况
+ */
+function runFullHideCheck() {
+    console.log(`[${extensionName}] Running optimized full hide check.`);
+    const context = getContext();
+    const chat = context.chat;
+    const currentChatLength = chat?.length || 0;
+
+    // 加载当前角色的设置，如果 chat 不存在则无法继续
+    const settings = loadCharacterSettings();
+    if (!chat) {
+        console.warn(`[${extensionName}] Full check aborted: Chat data not available.`);
+        // 重置处理长度可能不安全，因为不知道状态
+        return;
+    }
+    const { hideLastN } = settings;
+
+
+    // 1. 优化初始检查 (N=0 或 N >= length -> 全部可见)
+    if (hideLastN <= 0 || hideLastN >= currentChatLength) {
+        const needsToShowAny = chat.some(msg => msg && msg.is_system === true && !msg.is_user);
+        if (!needsToShowAny) {
+            console.log(`[${extensionName}] Full check (N=${hideLastN}): No messages are hidden or all should be visible, skipping.`);
+            settings.lastProcessedLength = currentChatLength; // 即使跳过也要更新长度
+            saveCharacterSettings(settings);
+            return; // 无需操作
+        }
+        // 如果需要显示，则继续执行下面的逻辑，visibleStart 会是 0
+    }
+
+    // 2. 计算可见边界
+    const visibleStart = (hideLastN > 0 && hideLastN < currentChatLength) ? currentChatLength - hideLastN : 0; // N<=0 或 N>=lengh 都从0开始可见
+
+    // 3. 差异计算 (结合跳跃扫描)
+    const toHide = [];
+    const toShow = [];
+    const SKIP_STEP = 10; // 跳跃扫描步长
+
+    // 检查需要隐藏的部分 (0 to visibleStart - 1)
+    for (let i = 0; i < visibleStart; i++) {
+        const msg = chat[i];
+        if (!msg) continue;
+        const isCurrentlyHidden = msg.is_system === true;
+
+        if (!isCurrentlyHidden && !msg.is_user) {
+            toHide.push(i);
+        } else if (isCurrentlyHidden) {
+            // 跳跃扫描逻辑
+            let lookAhead = 1;
+            const maxLookAhead = Math.min(visibleStart, i + SKIP_STEP); // 检查未来步长或到边界
+            while (i + lookAhead < maxLookAhead) {
+                 const nextMsg = chat[i + lookAhead];
+                 const nextIsHidden = nextMsg && nextMsg.is_system === true;
+                 if (!nextIsHidden) break; // 遇到非隐藏的，停止跳跃
+                 lookAhead++;
             }
-            
-            const endTime = performance.now();
-            console.log(`隐藏助手: 处理 ${chatLength} 条消息，变更 ${toChange.length} 条，耗时 ${(endTime - startTime).toFixed(2)}ms (计算: ${computeTime.toFixed(2)}ms)`);
-            
-            // 显示成功消息
-            if (toChange.length > 0) {
-                toastr.success(`已隐藏 ${toChange.filter(i => i.hide).length} 条消息，显示 ${toChange.filter(i => !i.hide).length} 条消息`);
-            } else {
-                toastr.info('消息状态已经符合设置，无需更改');
+            if (lookAhead > 1) {
+                 i += (lookAhead - 1); // 跳过检查过的 hidden 消息
             }
-            
-            return;
-        } catch (error) {
-            console.error('Worker处理失败，回退到同步处理:', error);
-            toastr.warning('快速处理失败，使用标准处理...');
-            // 继续使用同步处理作为回退
         }
     }
-    
-    // 同步处理（Worker不可用或失败时）
-    console.time('同步处理');
-    const syncStartTime = performance.now();
-    
+    // 检查需要显示的部分 (visibleStart to currentChatLength - 1)
+     for (let i = visibleStart; i < currentChatLength; i++) {
+        const msg = chat[i];
+        if (!msg) continue;
+        const isCurrentlyHidden = msg.is_system === true;
+
+        if (isCurrentlyHidden && !msg.is_user) {
+            toShow.push(i);
+        } else if (!isCurrentlyHidden) {
+             // 跳跃扫描逻辑 (检查 is_system === false)
+             let lookAhead = 1;
+             const maxLookAhead = Math.min(currentChatLength, i + SKIP_STEP);
+             while (i + lookAhead < maxLookAhead) {
+                  const nextMsg = chat[i + lookAhead];
+                  const nextIsVisible = nextMsg && nextMsg.is_system === false;
+                  if (!nextIsVisible) break;
+                  lookAhead++;
+             }
+             if (lookAhead > 1) {
+                  i += (lookAhead - 1);
+             }
+        }
+    }
+
+    // 4. 批量处理 (Data & DOM)
+    let changed = false;
+    // --- 更新数据 ---
+    if (toHide.length > 0) {
+        changed = true;
+        toHide.forEach(idx => { if (chat[idx]) chat[idx].is_system = true; });
+    }
+    if (toShow.length > 0) {
+        changed = true;
+        toShow.forEach(idx => { if (chat[idx]) chat[idx].is_system = false; });
+    }
+
+    // --- 更新 DOM ---
     try {
-        if (hideLastN > 0 && hideLastN < chatLength) {
-            const visibleStart = chatLength - hideLastN;
-            
-            // 计算需要隐藏和显示的范围
-            await hideChatMessageRange(0, visibleStart - 1, false); // 隐藏前面的消息
-            await hideChatMessageRange(visibleStart, chatLength - 1, true); // 显示后面的消息
-            
-            // 更新缓存
-            stateCache = {
-                lastHideN: hideLastN,
-                chatLength: chatLength,
-                messageStates: chat.map(msg => !!msg.is_system)
-            };
-            
-            extension_settings[extensionName].lastAppliedSettings = {
-                type: 'lastN',
-                value: hideLastN
-            };
-            saveSettingsDebounced();
-            
-            const syncEndTime = performance.now();
-            const syncTime = syncEndTime - syncStartTime;
-            
-            // 更新性能统计
-            performanceStats.lastRunTime = syncTime;
-            performanceStats.lastChangeCount = chatLength; // 同步模式下无法精确计算，使用总数
-            updatePerformanceStats(syncTime);
-            
-            // 更新性能面板
-            if (extension_settings[extensionName].enablePerformanceMonitoring) {
-                updatePerfPanel(syncTime, chatLength, chatLength);
-            }
-            
-            console.log(`隐藏助手(同步): 处理完成，耗时 ${syncTime.toFixed(2)}ms`);
-            toastr.success(`已保留最新的 ${hideLastN} 条消息，隐藏其余消息`);
+        if (toHide.length > 0) {
+            const hideSelector = toHide.map(id => `.mes[mesid="${id}"]`).join(',');
+            if (hideSelector) $(hideSelector).attr('is_system', 'true');
+        }
+        if (toShow.length > 0) {
+            const showSelector = toShow.map(id => `.mes[mesid="${id}"]`).join(',');
+             if (showSelector) $(showSelector).attr('is_system', 'false');
         }
     } catch (error) {
-        console.error('同步处理出错:', error);
-        toastr.error('处理失败: ' + error.message);
+        console.error(`[${extensionName}] Error updating DOM in full check:`, error);
     }
-    
-    console.timeEnd('同步处理');
-}
 
-// 保存当前设置为默认值
-function saveCurrentSettings() {
-    extension_settings[extensionName].lastAppliedSettings = {
-        type: 'lastN',
-        value: extension_settings[extensionName].hideLastN || 0
-    };
-    saveSettingsDebounced();
-    toastr.success('隐藏设置已保存');
-}
 
-// 应用上次保存的设置
-async function applyLastSettings() {
-    const lastSettings = extension_settings[extensionName].lastAppliedSettings;
-    
-    if (!lastSettings) return;
-    
-    if (lastSettings.type === 'lastN') {
-        extension_settings[extensionName].hideLastN = lastSettings.value;
-        updateUI();
-        await applyHideSettings();
+    // 5. 后续处理
+    if (changed) {
+         console.log(`[${extensionName}] Optimized Full check: Hiding ${toHide.length}, Showing ${toShow.length}`);
+         // 保存 Chat (包含 is_system 的修改)
+         context.saveChatDebounced?.();
+    } else {
+         console.log(`[${extensionName}] Optimized Full check: No changes needed.`);
     }
+
+    // 更新处理长度并保存设置
+    settings.lastProcessedLength = currentChatLength;
+    saveCharacterSettings(settings);
 }
 
-// 更新性能统计
-function updatePerformanceStats(runTime) {
-    performanceStats.runCount++;
-    performanceStats.averageRunTime = 
-        ((performanceStats.averageRunTime * (performanceStats.runCount - 1)) + runTime) / 
-        performanceStats.runCount;
-}
 
-// 添加性能监控面板
-function addPerformancePanel() {
-    const panel = document.createElement('div');
-    panel.id = 'hide-helper-performance';
-    panel.className = 'hide-helper-perf-panel';
-    panel.innerHTML = `
-        <div class="hide-helper-perf-header">隐藏助手性能</div>
-        <div class="hide-helper-perf-row">处理时间: <span id="hide-helper-perf-time">0</span>ms</div>
-        <div class="hide-helper-perf-row">消息总数: <span id="hide-helper-msg-count">0</span></div>
-        <div class="hide-helper-perf-row">变更数量: <span id="hide-helper-change-count">0</span></div>
-        <div class="hide-helper-perf-row">平均处理: <span id="hide-helper-avg-time">0</span>ms</div>
+// --- UI and Event Listeners ---
+
+// Create UI panel
+function createUI() {
+    // 确保只添加一次
+    if (document.getElementById('hide-helper-panel')) return;
+
+    const hideHelperPanel = document.createElement('div');
+    hideHelperPanel.id = 'hide-helper-panel';
+    // 移除了 hide-apply-btn
+    hideHelperPanel.innerHTML = `
+        <h4>隐藏助手 (Hide Helper)</h4>
+        <div class="hide-helper-section">
+            <label for="hide-last-n">保留最新楼层数:</label>
+            <input type="number" id="hide-last-n" min="0" placeholder="0 表示全部保留" style="width: 80px; margin-left: 5px; margin-right: 10px;">
+        </div>
+        <button class="menu_button" id="hide-save-settings-btn" title="保存设置并立即应用规则">保存当前设置</button>
+        <div style="font-size: small; margin-top: 5px; color: grey;">输入数字 N，将只保留最新的 N 条消息，之前的消息将被隐藏。0 表示不隐藏。</div>
     `;
-    document.body.appendChild(panel);
-    
-    // 默认隐藏
-    panel.style.display = 'none';
-}
-
-// 更新性能面板数据
-function updatePerfPanel(time, msgCount, changeCount) {
-    document.getElementById('hide-helper-perf-time').textContent = time.toFixed(2);
-    document.getElementById('hide-helper-msg-count').textContent = msgCount;
-    document.getElementById('hide-helper-change-count').textContent = changeCount;
-    document.getElementById('hide-helper-avg-time').textContent = performanceStats.averageRunTime.toFixed(2);
-}
-
-// 设置应用事件监听器
-function setupEventListeners() {
-    // 聊天切换事件
-    eventSource.on(event_types.CHAT_CHANGED, () => {
-        // 重置缓存
-        stateCache = {
-            lastHideN: -1,
-            chatLength: -1,
-            messageStates: []
-        };
-        
-        // 如果有上次设置，延迟应用
-        if (extension_settings[extensionName].lastAppliedSettings) {
-            setTimeout(applyLastSettings, 500);
-        }
-    });
-    
-    // 消息更新事件
-    eventSource.on(event_types.MESSAGE_UPDATED, () => {
-        // 下次应用时会重新计算
-    });
-    
-    // 新消息接收事件
-    eventSource.on(event_types.MESSAGE_RECEIVED, () => {
-        // 如果有应用的设置，检查是否需要重新应用
-        if (extension_settings[extensionName].lastAppliedSettings) {
-            // 获取当前chat长度
-            const context = getContext();
-            const chat = context.chat;
-            const chatLength = chat?.length || 0;
-            
-            // 如果长度变了，重新应用设置
-            if (chatLength !== stateCache.chatLength) {
-                // 短暂延迟确保DOM已更新
-                setTimeout(applyLastSettings, 100);
-            }
-        }
-    });
-    
-    // 加载更多消息事件
-    eventSource.on(event_types.MORE_MESSAGES_LOADED, () => {
-        // 如果有上次设置，延迟应用
-        if (extension_settings[extensionName].lastAppliedSettings) {
-            setTimeout(applyLastSettings, 500);
-        }
-    });
-}
-
-// 插件初始化
-jQuery(async () => {
-    // 加载设置
-    loadSettings();
-    
-    // 创建UI和性能面板
-    createUI();
-    
-    // 初始化Worker
-    initWorker();
-    
-    // 设置事件监听器
-    setupEventListeners();
-    setupUIEventListeners();
-    
-    // 应用上次保存的设置
-    if (extension_settings[extensionName].lastAppliedSettings) {
-        // 延迟应用，等待聊天完全加载
-        setTimeout(applyLastSettings, 1000);
+    // 将面板添加到扩展设置区域
+    const extensionsSettingsDiv = document.getElementById('extensions_settings');
+    if (extensionsSettingsDiv) {
+        extensionsSettingsDiv.appendChild(hideHelperPanel);
+    } else {
+        console.error(`[${extensionName}] Could not find #extensions_settings element to append UI.`);
+        // 作为后备，添加到 body，但这可能不是理想的位置
+        // document.body.appendChild(hideHelperPanel);
     }
-    
-    console.log('隐藏助手: 插件初始化完成');
+}
+
+// Setup event listeners for UI elements and application events
+function setupEventListeners() {
+    const hideLastNInput = document.getElementById('hide-last-n');
+    const saveSettingsBtn = document.getElementById('hide-save-settings-btn');
+
+    if (!hideLastNInput || !saveSettingsBtn) {
+        console.error(`[${extensionName}] UI elements not found, cannot setup listeners.`);
+        return;
+    }
+
+    // 输入框 'change' 事件 (当值改变且失去焦点时触发)
+    hideLastNInput.addEventListener('change', () => {
+        const value = parseInt(hideLastNInput.value);
+        if (isNaN(value) || value < 0) {
+             console.warn(`[${extensionName}] Invalid input value, resetting to 0.`);
+             hideLastNInput.value = 0; // 重置为有效值
+        }
+        const currentValue = parseInt(hideLastNInput.value) || 0;
+        const settings = loadCharacterSettings(); // 加载当前设置以比较
+
+        if (settings.hideLastN !== currentValue) {
+            console.log(`[${extensionName}] hideLastN changed via input: ${settings.hideLastN} -> ${currentValue}`);
+            settings.hideLastN = currentValue;
+            // 不需要立即执行 Full Check，由保存按钮触发
+            // runFullHideCheck(); // 不在这里触发，避免输入过程中执行
+            saveCharacterSettings(settings); // 只更新内存中的值
+        }
+    });
+
+    // 保存设置按钮
+    saveSettingsBtn.addEventListener('click', () => {
+        console.log(`[${extensionName}] Save settings button clicked.`);
+        const value = parseInt(hideLastNInput.value);
+         if (isNaN(value) || value < 0) {
+             toastr.error("请输入有效的保留楼层数 (大于等于0的整数)");
+             return;
+         }
+        const currentValue = parseInt(hideLastNInput.value) || 0;
+        const settings = loadCharacterSettings();
+        settings.hideLastN = currentValue; // 确保保存的是最新的 UI 值
+        saveCharacterSettings(settings); // 保存 hideLastN 和可能的 lastProcessedLength
+        runFullHideCheck(); // 执行全量检查并应用规则
+        toastr.success('隐藏设置已保存并应用');
+    });
+
+    // --- Application Event Listeners ---
+
+    // 新消息到达 (主要优化点) - 使用增量检查
+    eventSource.on(event_types.MESSAGE_RECEIVED, () => {
+        // 添加一个小的延迟/防抖可能更好，但通常不必要
+        setTimeout(runIncrementalHideCheck, 50); // 短暂延迟，确保消息渲染后执行
+    });
+
+    // 消息删除 - 必须用完整检查
+    eventSource.on(event_types.MESSAGE_DELETED, () => {
+        console.log(`[${extensionName}] Event ${event_types.MESSAGE_DELETED} received. Running full check.`);
+        // 短暂延迟防抖，防止快速连续删除触发多次
+        setTimeout(runFullHideCheck, 200);
+    });
+
+    // 聊天切换 - 必须用完整检查，并重新加载设置
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        console.log(`[${extensionName}] Event ${event_types.CHAT_CHANGED} received. Reloading settings and running full check.`);
+        // 确保在 Full Check 之前加载新聊天的设置
+        loadCharacterSettings();
+        // 不需要手动重置 lastProcessedLength，因为 loadCharacterSettings 会加载新聊天的值
+        setTimeout(runFullHideCheck, 200); // 延迟确保新聊天数据加载完成
+    });
+}
+
+// --- Extension Initialization ---
+jQuery(async () => {
+    console.log(`[${extensionName}] Initializing...`);
+    createUI();
+    setupEventListeners();
+
+    // 初始加载时，等待 CHAT_CHANGED 事件来首次加载设置和运行检查
+    // 因为 CHAT_CHANGED 在应用启动加载第一个聊天时也会触发
+    // 不需要在这里直接调用 runFullHideCheck，让 CHAT_CHANGED 处理首次加载
+    console.log(`[${extensionName}] Initialization complete. Waiting for CHAT_CHANGED event.`);
 });
