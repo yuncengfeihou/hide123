@@ -20,22 +20,33 @@ function loadSettings() {
 
 // 创建UI面板
 function createUI() {
-    const hideHelperPanel = document.createElement('div');
-    hideHelperPanel.id = 'hide-helper-panel';
-    hideHelperPanel.innerHTML = `
-        <h4>隐藏助手</h4>
-        <div class="hide-helper-section">
-            <label for="hide-last-n">隐藏楼层:</label>
-            <input type="number" id="hide-last-n" min="0" placeholder="隐藏最后N层之前的消息">
-            <div class="hide-helper-buttons">
-                <button id="hide-save-settings-btn">保存设置</button>
+    const settingsHtml = `
+    <div id="hide-helper-settings" class="hide-helper-container">
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>隐藏助手</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+                <div class="hide-helper-section">
+                    <label for="hide-last-n">隐藏楼层:</label>
+                    <div class="hide-helper-input-row">
+                        <input type="number" id="hide-last-n" min="0" placeholder="隐藏最后N层之前的消息">
+                    </div>
+                    <div class="hide-helper-actions">
+                        <button id="hide-save-settings-btn" class="hide-helper-btn success">保存设置</button>
+                    </div>
+                </div>
+                <div class="hide-helper-current">
+                    <strong>当前隐藏设置:</strong> <span id="hide-current-value">无</span>
+                </div>
+                <hr class="sysHR">
             </div>
         </div>
-        <div class="hide-helper-current">
-            <strong>当前隐藏设置:</strong> <span id="hide-current-value">无</span>
-        </div>
-    `;
-    document.body.appendChild(hideHelperPanel);
+    </div>`;
+    
+    // 将UI添加到SillyTavern扩展设置区域，而不是document.body
+    $("#extensions_settings").append(settingsHtml);
 
     // 设置事件监听器
     setupEventListeners();
@@ -84,6 +95,8 @@ function updateCurrentHideSettingsDisplay() {
     const currentSettings = getCurrentHideSettings();
     const displayElement = document.getElementById('hide-current-value');
     
+    if (!displayElement) return;
+    
     if (!currentSettings || currentSettings.hideLastN === 0) {
         displayElement.textContent = '无';
     } else {
@@ -95,6 +108,8 @@ function updateCurrentHideSettingsDisplay() {
 function setupEventListeners() {
     const hideLastNInput = document.getElementById('hide-last-n');
     
+    if (!hideLastNInput) return;
+    
     // 监听输入变化
     hideLastNInput.addEventListener('input', (e) => {
         const value = parseInt(e.target.value) || 0;
@@ -102,22 +117,27 @@ function setupEventListeners() {
     });
 
     // 保存设置按钮
-    document.getElementById('hide-save-settings-btn').addEventListener('click', () => {
-        const value = parseInt(hideLastNInput.value) || 0;
-        if (saveCurrentHideSettings(value)) {
-            applyHideSettings();
-            updateCurrentHideSettingsDisplay();
-            toastr.success('隐藏设置已保存');
-        } else {
-            toastr.error('无法保存设置');
-        }
-    });
+    const saveButton = document.getElementById('hide-save-settings-btn');
+    if (saveButton) {
+        saveButton.addEventListener('click', () => {
+            const value = parseInt(hideLastNInput.value) || 0;
+            if (saveCurrentHideSettings(value)) {
+                applyHideSettings();
+                updateCurrentHideSettingsDisplay();
+                toastr.success('隐藏设置已保存');
+            } else {
+                toastr.error('无法保存设置');
+            }
+        });
+    }
 
     // 监听聊天切换事件
     eventSource.on(event_types.CHAT_CHANGED, () => {
-        const currentSettings = getCurrentHideSettings();
-        hideLastNInput.value = currentSettings?.hideLastN || '';
-        updateCurrentHideSettingsDisplay();
+        if (hideLastNInput) {
+            const currentSettings = getCurrentHideSettings();
+            hideLastNInput.value = currentSettings?.hideLastN || '';
+            updateCurrentHideSettingsDisplay();
+        }
     });
 
     // 监听新消息事件
@@ -159,7 +179,9 @@ jQuery(async () => {
     setTimeout(() => {
         const currentSettings = getCurrentHideSettings();
         const hideLastNInput = document.getElementById('hide-last-n');
-        hideLastNInput.value = currentSettings?.hideLastN || '';
+        if (hideLastNInput) {
+            hideLastNInput.value = currentSettings?.hideLastN || '';
+        }
         updateCurrentHideSettingsDisplay();
     }, 1000);
 });
